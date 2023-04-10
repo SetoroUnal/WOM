@@ -1,0 +1,418 @@
+create or replace PROCEDURE PROC_CLIENTES_JINETEROS AS 
+BEGIN
+    INSERT /*+ APPEND */ INTO wom_aa_cliente_dk_jinete NOLOGGING
+WITH movimiento_hist_pi AS (
+            SELECT /*+ PARALLEL(2) */
+                cliente_dk,
+                subscriber_id,
+                msisdn,
+                periodo_proceso_codigo,
+                movimiento_tipo_nombre,
+                movimiento_nombre,
+                CASE
+                    WHEN movimiento_nombre = 'ACTIVACION' THEN
+                        fecha_alta
+                    WHEN movimiento_nombre = 'PERMANECE'  THEN
+                        TO_DATE(periodo_proceso_codigo, 'YYYYMM')
+                    ELSE
+                        fecha_baja
+                END                     fecha_movimiento,
+                fecha_alta,
+                fecha_baja,
+                fecha_baja - fecha_alta AS dias_activo
+            FROM
+                dwh_bodega_wom.fct_subscribers_ending
+            WHERE
+                servicio = 'Postpaid'
+        ), final_pi AS (
+            SELECT /*+ PARALLEL(2) */
+                movimiento_hist_pi.*,
+                ROW_NUMBER()
+                OVER(PARTITION BY msisdn
+                     ORDER BY
+                         fecha_movimiento
+                )                         orden,
+                LAG(movimiento_tipo_nombre, 1)
+                OVER(PARTITION BY msisdn
+                     ORDER BY
+                         fecha_movimiento
+                )                         movimiento_ant,
+                LEAD(movimiento_tipo_nombre, 1)
+                OVER(PARTITION BY msisdn
+                     ORDER BY
+                         fecha_movimiento
+                )                         movimiento_sig,
+                LEAD(fecha_movimiento, 1)
+                OVER(PARTITION BY msisdn
+                     ORDER BY
+                         fecha_alta, periodo_proceso_codigo
+                )                         fecha_sig,
+                SUM(
+                    CASE
+                        WHEN movimiento_nombre = 'DESCONEXION' THEN
+                            1
+                        ELSE
+                            0
+                    END
+                )
+                OVER(PARTITION BY subscriber_id
+                     ORDER BY
+                         fecha_movimiento
+                )                         churn,
+                SUM(
+                    CASE
+                        WHEN movimiento_tipo_nombre = 'CHURN PORTACION' THEN
+                            1
+                        ELSE
+                            0
+                    END
+                )
+                OVER(PARTITION BY msisdn
+                     ORDER BY
+                         fecha_movimiento
+                )                         portout,
+                SUM(
+                    CASE
+                        WHEN movimiento_tipo_nombre = 'CHURN VOLUNTARIO' THEN
+                            1
+                        ELSE
+                            0
+                    END
+                )
+                OVER(PARTITION BY msisdn
+                     ORDER BY
+                         fecha_movimiento
+                )                         cancelaciones,
+                COUNT(
+                    CASE
+                        WHEN movimiento_tipo_nombre = 'CHURN PORTACION' THEN
+                            1
+                    END
+                )
+                OVER(PARTITION BY msisdn) AS num_portout,
+                COUNT(
+                    CASE
+                        WHEN movimiento_tipo_nombre = 'CHURN VOLUNTARIO' THEN
+                            1
+                    END
+                )
+                OVER(PARTITION BY msisdn) AS num_cancelaciones,
+                SUM(
+                    CASE
+                        WHEN movimiento_tipo_nombre LIKE '%GROSS%' THEN
+                            1
+                        ELSE
+                            0
+                    END
+                )
+                OVER(PARTITION BY msisdn
+                     ORDER BY
+                         fecha_movimiento
+                )                         gross
+            FROM
+                movimiento_hist_pi
+        ), base_pi AS (
+            SELECT /*+ PARALLEL(2) */
+                final_pi.*,
+                ROW_NUMBER()
+                OVER(PARTITION BY msisdn, churn
+                     ORDER BY
+                         fecha_movimiento
+                )   orden2,
+                CASE
+                    WHEN portout = 0
+                         AND cancelaciones = 0
+                         AND churn = 0 THEN
+                        'NO_JINETE'
+                    WHEN portout != 0
+                         AND cancelaciones != 0 THEN
+                        'MIXTO'
+                    WHEN portout != 0
+                         AND cancelaciones = 0 THEN
+                        'PORTIN'
+                    WHEN portout = 0
+                         AND cancelaciones != 0 THEN
+                        'CANCELACION'
+                    ELSE
+                        'OTRO'
+                END AS tipo_jinete,
+                CASE
+                    WHEN num_portout = 0
+                         AND num_cancelaciones = 0
+                         AND churn = 0 THEN
+                        'NO_JINETE'
+                    WHEN num_portout != 0
+                         AND num_cancelaciones != 0 THEN
+                        'MIXTO'
+                    WHEN num_portout != 0
+                         AND num_cancelaciones = 0 THEN
+                        'PORTIN'
+                    WHEN num_portout = 0
+                         AND num_cancelaciones != 0 THEN
+                        'CANCELACION'
+                    ELSE
+                        'OTRO'
+                END AS tipo_jinetero,
+                CASE
+                    WHEN churn = 0 THEN
+                        'CERO_PORTOUT'
+                    WHEN churn = 1 THEN
+                        'UN_PORTOUT'
+                    WHEN churn = 2 THEN
+                        'DOS_PORTOUT'
+                    WHEN churn = 3 THEN
+                        'TRES_PORTOUT'
+                    ELSE
+                        'MAS_TRES_PORTOUT'
+                END AS movimiento_tipo_nombre_2,
+                CASE
+                    WHEN churn = 0 THEN
+                        1
+                    ELSE
+                        0
+                END AS cero_churn,
+                CASE
+                    WHEN churn = 1 THEN
+                        1
+                    ELSE
+                        0
+                END AS un_churn,
+                CASE
+                    WHEN churn = 2 THEN
+                        1
+                    ELSE
+                        0
+                END AS dos_churn,
+                CASE
+                    WHEN churn = 3 THEN
+                        1
+                    ELSE
+                        0
+                END AS tres_churn,
+                CASE
+                    WHEN churn > 3 THEN
+                        1
+                    ELSE
+                        0
+                END AS mas_tres_churn
+            FROM
+                final_pi
+        ), jineteros_pi AS (
+            SELECT /*+ PARALLEL(2) */
+                cliente_dk,
+                msisdn,
+                fecha_movimiento,
+                to_char(fecha_movimiento, 'YYYYMMDD') AS fecha_in_vigencia,
+                '20301224'                            AS fecha_fin_vigencia,
+                ROW_NUMBER()
+                OVER(PARTITION BY cliente_dk
+                     ORDER BY
+                         fecha_movimiento
+                )                                     orden3,
+                movimiento_tipo_nombre,
+                churn,
+                portout,
+                cancelaciones,
+                num_portout,
+                num_cancelaciones,
+                tipo_jinete,
+                tipo_jinetero,
+                orden,
+                orden2
+            FROM
+                base_pi
+            WHERE
+                    churn = 2
+                AND orden2 = 1
+        ), jinetes_portin AS (
+            SELECT /*+ PARALLEL(2) */
+                cliente_dk,
+                fecha_in_vigencia,
+                fecha_fin_vigencia,
+                tipo_jinete
+            FROM
+                jineteros_pi
+            WHERE
+                orden3 = 1
+        ), movimiento_hist_ln AS (
+            SELECT /*+ PARALLEL(2) */
+                cliente_dk,
+                COUNT(DISTINCT msisdn)
+                OVER(PARTITION BY cliente_dk) AS lineasxusuario,
+                subscriber_id,
+                msisdn,
+                periodo_proceso_codigo,
+                movimiento_tipo_nombre,
+                CASE
+                    WHEN movimiento_nombre = 'ACTIVACION' THEN
+                        fecha_alta
+                    WHEN movimiento_nombre = 'PERMANECE'  THEN
+                        TO_DATE(periodo_proceso_codigo, 'YYYYMM')
+                    ELSE
+                        fecha_baja
+                END                           fecha_movimiento,
+                fecha_alta,
+                fecha_baja,
+                fecha_baja - fecha_alta       AS dias_activo
+            FROM
+                dwh_bodega_wom.fct_subscribers_ending
+            WHERE
+                servicio = 'Postpaid'
+        )
+  
+        
+        , final_ln AS (
+            SELECT /*+ PARALLEL(2) */
+                movimiento_hist_ln.*,
+                ROW_NUMBER()
+                OVER(PARTITION BY msisdn
+                     ORDER BY
+                         fecha_movimiento
+                )                         orden,
+                SUM(
+                    CASE
+                        WHEN movimiento_tipo_nombre = 'CHURN VOLUNTARIO' THEN
+                            1
+                        ELSE
+                            0
+                    END
+                )
+                OVER(PARTITION BY msisdn
+                     ORDER BY
+                         fecha_movimiento
+                )                         cancelacionesxlinea,
+                SUM(
+                    CASE
+                        WHEN movimiento_tipo_nombre = 'CHURN VOLUNTARIO' THEN
+                            1
+                        ELSE
+                            0
+                    END
+                )
+                OVER(PARTITION BY cliente_dk
+                     ORDER BY
+                         fecha_movimiento
+                )                         cancelacionesxcdk,
+                COUNT(
+                    CASE
+                        WHEN movimiento_tipo_nombre = 'CHURN VOLUNTARIO' THEN
+                            1
+                    END
+                )
+                OVER(PARTITION BY msisdn) AS num_cancelaciones,
+                SUM(
+                    CASE
+                        WHEN movimiento_tipo_nombre LIKE '%GROSS%' THEN
+                            1
+                        ELSE
+                            0
+                    END
+                )
+                OVER(PARTITION BY msisdn
+                     ORDER BY
+                         fecha_movimiento
+                )                         gross
+            FROM
+                movimiento_hist_ln
+            WHERE
+                    cliente_dk != - 2
+                AND lineasxusuario > 1
+                AND dias_activo <= 62
+                AND movimiento_tipo_nombre = 'CHURN VOLUNTARIO'
+        )
+               
+        
+        , jineteros_ln AS (
+            SELECT /*+ PARALLEL(2) */
+                cliente_dk,
+                lineasxusuario,
+                msisdn,
+                fecha_movimiento,
+                to_char(fecha_movimiento, 'YYYYMMDD') AS fecha_in_vigencia,
+                '20301224'                            AS fecha_fin_vigencia,
+                ROW_NUMBER()
+                OVER(PARTITION BY cliente_dk
+                     ORDER BY
+                         fecha_movimiento
+                )                                     orden4,
+                movimiento_tipo_nombre,
+                cancelacionesxlinea,
+                cancelacionesxcdk,
+                num_cancelaciones,
+                'LINEA NUEVA'                         AS tipo_jinete,
+                orden
+            FROM
+                final_ln
+        )
+        
+        
+        , jinetes_lineanueva AS (
+            SELECT /*+ PARALLEL(2) */
+                cliente_dk,
+                fecha_in_vigencia,
+                fecha_fin_vigencia,
+                tipo_jinete
+            FROM
+                jineteros_ln
+            WHERE
+                orden4 = 1
+        )
+    
+               
+        , jinetes_join AS (
+            SELECT
+                COALESCE (jinetes_portin.cliente_dk, jinetes_lineanueva.cliente_dk ) CLIENTE_DK,
+                jinetes_portin.fecha_in_vigencia,
+                jinetes_portin.fecha_fin_vigencia,
+                jinetes_portin.tipo_jinete,
+                jinetes_lineanueva.fecha_in_vigencia  AS fecha_in_vigencia_1,
+                jinetes_lineanueva.fecha_fin_vigencia AS fecha_fin_vigencia_1,
+                jinetes_lineanueva.tipo_jinete        AS tipo_jinete_1
+            FROM
+                jinetes_portin
+                FULL OUTER JOIN jinetes_lineanueva ON jinetes_portin.cliente_dk = jinetes_lineanueva.cliente_dk
+        )
+              
+              
+        , jinetes_final AS (
+            SELECT cliente_dk,
+            CASE WHEN fecha_in_vigencia_1 IS NULL THEN fecha_in_vigencia
+            WHEN fecha_in_vigencia_1 IS NOT NULL THEN ( ( CASE
+                                                        WHEN fecha_in_vigencia < fecha_in_vigencia_1 THEN
+                                    fecha_in_vigencia
+                                ELSE
+                                    fecha_in_vigencia_1
+                            END
+                        ) ) END AS fecha_ini_vigencia,
+          CASE WHEN fecha_fin_vigencia IS NULL THEN fecha_fin_vigencia_1 ELSE fecha_fin_vigencia end as FECHA_FIN_VIGENCIA,
+          CASE WHEN tipo_jinete_1 IS NOT NULL AND tipo_jinete IS NOT NULL THEN tipo_jinete || ' + ' || tipo_jinete_1
+               WHEN tipo_jinete_1 IS NULL AND tipo_jinete IS NOT NULL THEN tipo_jinete
+               WHEN tipo_jinete IS NULL AND tipo_jinete_1 IS NOT NULL THEN tipo_jinete_1
+               END AS jinete_tipo
+            FROM
+                jinetes_join
+            WHERE
+                cliente_dk != - 2
+        )
+        
+SELECT
+            JF.CLIENTE_DK AS CLIENTE_DK,
+            JF.FECHA_INI_VIGENCIA AS FECHA_INI_VIGENCIA , 
+            JF.FECHA_FIN_VIGENCIA AS FECHA_FIN_VIGENCIA ,
+            JF.JINETE_TIPO AS JINETE_TIPO
+        FROM
+            jinetes_final JF 
+            LEFT JOIN wom_aa_cliente_dk_jinete JIN
+            ON JF.CLIENTE_DK = JIN.CLIENTE_DK
+            AND JF.FECHA_INI_VIGENCIA = JIN.FECHA_INI_VIGENCIA
+            AND JF.FECHA_FIN_VIGENCIA = JIN.FECHA_FIN_VIGENCIA
+            AND JF.JINETE_TIPO = JIN.JINETE_TIPO
+            WHERE JIN.CLIENTE_DK IS NULL
+            
+
+;
+
+    COMMIT;
+
+
+end  ;
